@@ -1,4 +1,5 @@
 using System.Windows.Input;
+using System.Windows;
 
 namespace PdfTool.App.Commands;
 
@@ -19,7 +20,17 @@ public class RelayCommand : ICommand
 
     public void Execute(object? parameter) => _execute();
 
-    public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+    public void RaiseCanExecuteChanged()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher == null || dispatcher.CheckAccess())
+        {
+            CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        _ = dispatcher.InvokeAsync(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+    }
 }
 
 public class RelayCommand<T> : ICommand
@@ -61,5 +72,15 @@ public class RelayCommand<T> : ICommand
         _execute(default);
     }
 
-    public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+    public void RaiseCanExecuteChanged()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher == null || dispatcher.CheckAccess())
+        {
+            CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        _ = dispatcher.InvokeAsync(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+    }
 }

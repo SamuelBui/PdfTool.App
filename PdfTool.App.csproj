@@ -21,6 +21,13 @@
     <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="tmp-test\**\*.cs" />
+    <EmbeddedResource Remove="tmp-test\**\*" />
+    <None Remove="tmp-test\**\*" />
+    <Page Remove="tmp-test\**\*.xaml" />
+  </ItemGroup>
+
   <Target Name="PreparePdfiumNativeDll" AfterTargets="Build">
     <Copy SourceFiles="$(TargetDir)pdfium_x64.dll"
           DestinationFiles="$(TargetDir)pdfium.dll"

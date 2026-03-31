@@ -7,6 +7,7 @@ public class PdfDocumentInfo
     public long FileSizeBytes { get; set; }
     public int? PageCount { get; set; }
     public bool IsEncrypted { get; set; }
+    public bool HasOwnerPermissions { get; set; }
     public bool RequiresPassword { get; set; }
     public bool IsPasswordIncorrect { get; set; }
     public bool CanReadContents { get; set; }

@@ -1,5 +1,6 @@
 using System.IO;
 using PdfSharp.Pdf.IO;
+using PdfTool.App.Helpers;
 using PdfTool.App.Models;
 
 namespace PdfTool.App.Services;
@@ -40,8 +41,13 @@ public class PdfDocumentInspectorService : IPdfDocumentInspectorService
                 : PdfReader.Open(filePath, password, PdfDocumentOpenMode.Import, new PdfReaderOptions());
             info.PageCount = document.PageCount;
             info.IsEncrypted = document.SecuritySettings.IsEncrypted;
+            info.HasOwnerPermissions = PdfSecurityAccessHelper.HasOwnerPermissions(document, password);
             info.CanReadContents = true;
-            info.StatusMessage = info.IsEncrypted ? "Encrypted PDF unlocked." : "Ready";
+            info.StatusMessage = info.IsEncrypted
+                ? info.HasOwnerPermissions
+                    ? "Encrypted PDF opened with owner permissions."
+                    : "Encrypted PDF opened with user permissions only."
+                : "Ready";
             return info;
         }
         catch (Exception ex)
