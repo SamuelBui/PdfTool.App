@@ -24,11 +24,32 @@ public partial class MainWindow : Window
     private ListBox? _mergePageToggleListBox;
     private bool _mergePageDragTriggered;
     private ListBox? _mergeSweepListBox;
+    private bool _sessionAutoRestored;
 
     public MainWindow()
     {
         InitializeComponent();
-        Loaded += (_, _) => SyncProtectPasswordBoxes();
+        Loaded += MainWindow_OnLoaded;
+        Closing += MainWindow_OnClosing;
+    }
+
+    private void MainWindow_OnLoaded(object sender, RoutedEventArgs e)
+    {
+        if (!_sessionAutoRestored && DataContext is MainViewModel mainViewModel)
+        {
+            mainViewModel.TryAutoRestoreSession(this);
+            _sessionAutoRestored = true;
+        }
+
+        SyncProtectPasswordBoxes();
+    }
+
+    private void MainWindow_OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (DataContext is MainViewModel mainViewModel)
+        {
+            mainViewModel.AutoSaveSession(this);
+        }
     }
 
     private void ProtectUserPasswordBox_OnPasswordChanged(object sender, RoutedEventArgs e)
@@ -518,11 +539,26 @@ public partial class MainWindow : Window
 
     private void SplitPageList_OnDragOver(object sender, DragEventArgs e)
     {
+        if (DataContext is MainViewModel mainViewModel && sender is ListBox listBox)
+        {
+            AutoScroll(listBox, e.GetPosition(listBox), Orientation.Vertical);
+            var targetItem = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject)?.DataContext as PdfPageOrganizerItem;
+            mainViewModel.Split.SetDropTarget(targetItem);
+        }
+
         e.Effects = e.Data.GetDataPresent(SplitPagesDragDataFormat)
             ? DragDropEffects.Move
             : DragDropEffects.None;
 
         e.Handled = true;
+    }
+
+    private void SplitPageList_OnDragLeave(object sender, DragEventArgs e)
+    {
+        if (DataContext is MainViewModel mainViewModel)
+        {
+            mainViewModel.Split.ClearDropTargets();
+        }
     }
 
     private void SplitPageList_OnDrop(object sender, DragEventArgs e)
@@ -531,6 +567,8 @@ public partial class MainWindow : Window
         {
             return;
         }
+
+        mainViewModel.Split.ClearDropTargets();
 
         if (!e.Data.GetDataPresent(SplitPagesDragDataFormat))
         {
@@ -644,7 +682,11 @@ public partial class MainWindow : Window
         }
 
         ProtectUserPasswordBox.Password = mainViewModel.Protect.UserPassword;
+        ProtectUserPasswordBoxCompact.Password = mainViewModel.Protect.UserPassword;
         ProtectOwnerPasswordBox.Password = mainViewModel.Protect.OwnerPassword;
+        ProtectOwnerPasswordBoxCompact.Password = mainViewModel.Protect.OwnerPassword;
+        ProtectBatchOwnerPasswordBoxCompact.Password = mainViewModel.Protect.OwnerPassword;
         ProtectCommonPasswordBox.Password = mainViewModel.Protect.BatchCommonPassword;
+        ProtectCommonPasswordBoxCompact.Password = mainViewModel.Protect.BatchCommonPassword;
     }
 }

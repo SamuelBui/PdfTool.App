@@ -8,10 +8,20 @@ namespace PdfTool.App.Services;
 
 public class PdfMergeService : IPdfMergeService
 {
+    private readonly IAppLogger _logger;
+
+    public PdfMergeService(IAppLogger logger)
+    {
+        _logger = logger;
+    }
+
     public OperationResult Merge(IReadOnlyList<PdfFileItem> inputFiles, string outputPath)
     {
+        string? tempOutputPath = null;
+
         try
         {
+            _logger.LogInfo($"Merge start. Output='{outputPath}', Files={inputFiles.Count}.");
             var totalPages = inputFiles.Sum(file => file.PageThumbnails.Count > 0
                 ? file.PageThumbnails.Count
                 : file.PageCount.GetValueOrDefault());
@@ -81,12 +91,21 @@ public class PdfMergeService : IPdfMergeService
                 }
             }
 
-            outputDocument.Save(outputPath);
+            tempOutputPath = SafeFileWriteHelper.CreateTemporaryOutputPath(outputPath, "merge");
+            outputDocument.Save(tempOutputPath);
+            SafeFileWriteHelper.CommitTemporaryFile(tempOutputPath, outputPath);
+            tempOutputPath = null;
+            _logger.LogInfo($"Merge success. Output='{outputPath}', TotalPages={totalPages}.");
             return OperationResult.Ok("Merge completed successfully.", outputPath);
         }
         catch (Exception ex)
         {
+            _logger.LogError($"Merge failed. Output='{outputPath}'.", ex);
             return OperationResult.Fail($"Merge failed: {ex.Message}");
+        }
+        finally
+        {
+            SafeFileWriteHelper.TryDeleteTemporaryFile(tempOutputPath);
         }
     }
 

@@ -18,10 +18,11 @@ public class SplitViewModel : BaseViewModel
     private readonly IRecentFilesService _recentFilesService;
     private string _inputPath = string.Empty;
     private string _outputFolder = string.Empty;
+    private string _documentPassword = string.Empty;
+    private string _documentOwnerPassword = string.Empty;
     private string _statusMessage = "Choose a PDF to organize pages.";
     private bool _lastOperationSucceeded;
     private bool _isBusy;
-    private RecentFileItem? _selectedRecentFile;
     private SplitSelectionPreset _selectionPreset = SplitSelectionPreset.EveryPage;
     private SplitOutputStrategy _outputStrategy = SplitOutputStrategy.SeparateFiles;
     private string _pageSelectionInput = string.Empty;
@@ -29,7 +30,14 @@ public class SplitViewModel : BaseViewModel
     private string _selectionSummary = "No document loaded.";
     private string _outputPreviewSummary = "Output summary will appear here.";
     private string _validationMessage = "Choose a PDF to begin.";
+    private string _documentLoadMessage = "Choose a PDF to begin.";
+    private string _documentEncryptionText = "Not loaded";
+    private string _documentPasswordHint = "Load a PDF to inspect its protection status.";
     private bool _isApplyingSelectionPreset;
+    private bool _isDocumentEncrypted;
+    private bool _requiresDocumentPassword;
+    private bool _isDocumentPasswordIncorrect;
+    private bool _hasOwnerLevelAccess;
     private long _inputFileSizeBytes;
 
     public SplitViewModel(
@@ -42,14 +50,13 @@ public class SplitViewModel : BaseViewModel
         _thumbnailService = thumbnailService;
         _statusService = statusService;
         _recentFilesService = recentFilesService;
-        RecentFiles = recentFilesService.Files;
         Pages = new ObservableCollection<PdfPageOrganizerItem>();
         OutputPreviewItems = new ObservableCollection<SplitOutputPreviewItem>();
         Pages.CollectionChanged += PagesOnCollectionChanged;
 
         BrowseInputCommand = new RelayCommand(BrowseInput);
         BrowseOutputFolderCommand = new RelayCommand(BrowseOutputFolder);
-        UseRecentFileCommand = new RelayCommand(UseRecentFile, () => SelectedRecentFile != null && !IsBusy);
+        ReloadProtectedDocumentCommand = new RelayCommand(ReloadProtectedDocument, () => !IsBusy && !string.IsNullOrWhiteSpace(InputPath));
         ExtractSelectedCommand = new RelayCommand(ExtractSelectedPages, CanRunOrganizerAction);
         RemoveSelectedPagesCommand = new RelayCommand(RemoveSelectedPages, CanRunOrganizerAction);
         RotateLeftCommand = new RelayCommand(() => RotateSelectedPages(-90), CanRunOrganizerAction);
@@ -66,12 +73,39 @@ public class SplitViewModel : BaseViewModel
         {
             if (SetProperty(ref _inputPath, value))
             {
+                ClearDocumentPasswords();
                 if (string.IsNullOrWhiteSpace(OutputFolder) && !string.IsNullOrWhiteSpace(value))
                 {
                     OutputFolder = FileNameHelper.CreateSplitFolderPath(value);
                 }
 
                 LoadDocumentPages();
+                RefreshCommands();
+            }
+        }
+    }
+
+    public string DocumentPassword
+    {
+        get => _documentPassword;
+        set
+        {
+            if (SetProperty(ref _documentPassword, value))
+            {
+                UpdateValidationMessage();
+                RefreshCommands();
+            }
+        }
+    }
+
+    public string DocumentOwnerPassword
+    {
+        get => _documentOwnerPassword;
+        set
+        {
+            if (SetProperty(ref _documentOwnerPassword, value))
+            {
+                UpdateValidationMessage();
                 RefreshCommands();
             }
         }
@@ -296,26 +330,26 @@ public class SplitViewModel : BaseViewModel
         set => SetProperty(ref _validationMessage, value);
     }
 
+    public string DocumentEncryptionText
+    {
+        get => _documentEncryptionText;
+        set => SetProperty(ref _documentEncryptionText, value);
+    }
+
+    public string DocumentPasswordHint
+    {
+        get => _documentPasswordHint;
+        set => SetProperty(ref _documentPasswordHint, value);
+    }
+
     public ObservableCollection<PdfPageOrganizerItem> Pages { get; }
     public ObservableCollection<SplitOutputPreviewItem> OutputPreviewItems { get; }
     public IReadOnlyList<PdfPageOrganizerItem> SelectedPages => Pages.Where(page => page.IsSelected).ToList();
-    public ReadOnlyObservableCollection<RecentFileItem> RecentFiles { get; }
-
-    public RecentFileItem? SelectedRecentFile
-    {
-        get => _selectedRecentFile;
-        set
-        {
-            if (SetProperty(ref _selectedRecentFile, value))
-            {
-                UseRecentFileCommand.RaiseCanExecuteChanged();
-            }
-        }
-    }
+    public bool IsDocumentPasswordPanelVisible => _isDocumentEncrypted || _requiresDocumentPassword || _isDocumentPasswordIncorrect;
 
     public RelayCommand BrowseInputCommand { get; }
     public RelayCommand BrowseOutputFolderCommand { get; }
-    public RelayCommand UseRecentFileCommand { get; }
+    public RelayCommand ReloadProtectedDocumentCommand { get; }
     public RelayCommand ExtractSelectedCommand { get; }
     public RelayCommand RemoveSelectedPagesCommand { get; }
     public RelayCommand RotateLeftCommand { get; }
@@ -350,17 +384,9 @@ public class SplitViewModel : BaseViewModel
         }
     }
 
-    private void UseRecentFile()
+    private void ReloadProtectedDocument()
     {
-        if (SelectedRecentFile == null)
-        {
-            return;
-        }
-
-        InputPath = SelectedRecentFile.FilePath;
-        OutputFolder = FileNameHelper.CreateSplitFolderPath(InputPath);
-        StatusMessage = "Recent PDF loaded into Page Organizer.";
-        LastOperationSucceeded = false;
+        LoadDocumentPages();
     }
 
     private void LoadDocumentPages()
@@ -369,6 +395,8 @@ public class SplitViewModel : BaseViewModel
 
         if (string.IsNullOrWhiteSpace(InputPath) || !File.Exists(InputPath))
         {
+            UpdateDocumentSecurityState(null);
+            _documentLoadMessage = "Choose a PDF to begin.";
             _inputFileSizeBytes = 0;
             PageCountText = "0 pages";
             SelectionSummary = "No document loaded.";
@@ -379,7 +407,29 @@ public class SplitViewModel : BaseViewModel
         }
 
         _inputFileSizeBytes = new FileInfo(InputPath).Length;
-        var info = _service.LoadDocumentInfo(InputPath);
+        var info = _service.LoadDocumentInfo(InputPath, GetEffectiveAccessPassword());
+        UpdateDocumentSecurityState(info);
+        if (!info.IsValidPdf || info.RequiresPassword || info.IsPasswordIncorrect || (info.IsEncrypted && !info.HasOwnerPermissions) || info.PageCount == 0)
+        {
+            _documentLoadMessage = string.IsNullOrWhiteSpace(info.StatusMessage)
+                ? "Unable to load pages from this PDF."
+                : info.StatusMessage;
+            if (info.IsEncrypted && !info.RequiresPassword && !info.IsPasswordIncorrect && !info.HasOwnerPermissions)
+            {
+                _documentLoadMessage = "Owner password is required to organize pages from this protected PDF.";
+            }
+            PageCountText = "0 pages";
+            SelectionSummary = "No document loaded.";
+            OutputPreviewSummary = "Output summary will appear here.";
+            OutputPreviewItems.Clear();
+            ValidationMessage = _documentLoadMessage;
+            StatusMessage = _documentLoadMessage;
+            LastOperationSucceeded = false;
+            RefreshCommands();
+            return;
+        }
+
+        _documentLoadMessage = string.Empty;
         foreach (var page in info.Pages)
         {
             page.PropertyChanged += PageOnPropertyChanged;
@@ -392,7 +442,7 @@ public class SplitViewModel : BaseViewModel
         UpdateSelectionSummary();
         UpdateNamingPreview();
         UpdateValidationMessage();
-        LoadThumbnailsAsync(InputPath);
+        LoadThumbnailsAsync(InputPath, GetEffectiveAccessPassword());
     }
 
     private void ApplySelectionPreset()
@@ -460,6 +510,7 @@ public class SplitViewModel : BaseViewModel
         => !IsBusy
            && !string.IsNullOrWhiteSpace(InputPath)
            && !string.IsNullOrWhiteSpace(OutputFolder)
+           && CanAccessProtectedDocument()
            && SelectedPages.Count > 0;
 
     private async void ExtractSelectedPages()
@@ -482,7 +533,7 @@ public class SplitViewModel : BaseViewModel
             "Remove selected pages failed.");
     }
 
-    private async void RotateSelectedPages(int delta)
+    private void RotateSelectedPages(int delta)
     {
         var selectedPages = SelectedPages;
         if (selectedPages.Count == 0)
@@ -536,6 +587,8 @@ public class SplitViewModel : BaseViewModel
         {
             _statusService.Fail(failureStatus);
         }
+
+        ClearDocumentPasswords();
     }
 
     private PdfSplitOperationOptions CreateOperationOptions(int rotationDelta = 0)
@@ -543,6 +596,7 @@ public class SplitViewModel : BaseViewModel
         {
             InputPath = InputPath,
             OutputFolder = OutputFolder,
+            Password = GetEffectiveAccessPassword(),
             SelectedPages = SelectedPages.Select(page => page.PageNumber).ToList(),
             PageSequence = Pages.Select(page => page.PageNumber).ToList(),
             PageRotations = Pages.ToDictionary(page => page.PageNumber, page => page.Rotation),
@@ -596,6 +650,22 @@ public class SplitViewModel : BaseViewModel
 
     private void UpdateValidationMessage()
     {
+        if (!string.IsNullOrWhiteSpace(_documentLoadMessage))
+        {
+            ValidationMessage = _documentLoadMessage;
+            return;
+        }
+
+        if (!CanAccessProtectedDocument())
+        {
+            ValidationMessage = _isDocumentPasswordIncorrect
+                ? "Incorrect password. Enter the correct password and reload the document."
+                : _requiresDocumentPassword
+                    ? "Password required. Enter the password and reload the document."
+                    : "Owner password is required to organize pages from this protected PDF.";
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(InputPath))
         {
             ValidationMessage = "Choose a PDF to begin.";
@@ -690,7 +760,7 @@ public class SplitViewModel : BaseViewModel
             return;
         }
 
-        var targetIndex = targetPage == null ? Pages.Count : Pages.IndexOf(targetPage);
+        var targetIndex = targetPage == null ? Pages.Count : Pages.IndexOf(targetPage) + 1;
         if (targetIndex < 0)
         {
             targetIndex = Pages.Count;
@@ -718,9 +788,26 @@ public class SplitViewModel : BaseViewModel
         RefreshCommands();
     }
 
+    public void ClearDropTargets()
+    {
+        foreach (var page in Pages)
+        {
+            page.IsDropTarget = false;
+        }
+    }
+
+    public void SetDropTarget(PdfPageOrganizerItem? targetPage)
+    {
+        ClearDropTargets();
+        if (targetPage != null)
+        {
+            targetPage.IsDropTarget = true;
+        }
+    }
+
     private void RefreshCommands()
     {
-        UseRecentFileCommand.RaiseCanExecuteChanged();
+        ReloadProtectedDocumentCommand.RaiseCanExecuteChanged();
         ExtractSelectedCommand.RaiseCanExecuteChanged();
         RemoveSelectedPagesCommand.RaiseCanExecuteChanged();
         RotateLeftCommand.RaiseCanExecuteChanged();
@@ -730,9 +817,14 @@ public class SplitViewModel : BaseViewModel
         ApplySelectionPresetCommand.RaiseCanExecuteChanged();
     }
 
-    private async void LoadThumbnailsAsync(string inputPath)
+    private async void LoadThumbnailsAsync(string inputPath, string? password)
     {
-        var results = await Task.Run(() => _thumbnailService.RenderDocumentThumbnails(inputPath, 84, 112));
+        if (Pages.Count == 0)
+        {
+            return;
+        }
+
+        var results = await Task.Run(() => _thumbnailService.RenderDocumentThumbnails(inputPath, 84, 112, null, password));
 
         if (!string.Equals(InputPath, inputPath, StringComparison.OrdinalIgnoreCase))
         {
@@ -839,6 +931,144 @@ public class SplitViewModel : BaseViewModel
                     }
                 ]
         };
+    }
+
+    public SplitSessionState CaptureSessionState()
+    {
+        return new SplitSessionState
+        {
+            InputPath = InputPath,
+            OutputFolder = OutputFolder,
+            SelectionPreset = SelectionPreset,
+            OutputStrategy = OutputStrategy,
+            PageSelectionInput = PageSelectionInput,
+            Pages = Pages.Select(page => new SplitPageSessionState
+            {
+                SourcePageNumber = page.SourcePageNumber,
+                Rotation = page.Rotation,
+                IsSelected = page.IsSelected
+            }).ToList()
+        };
+    }
+
+    public void RestoreSessionState(SplitSessionState? state)
+    {
+        if (state == null)
+        {
+            return;
+        }
+
+        InputPath = state.InputPath ?? string.Empty;
+        OutputFolder = state.OutputFolder ?? string.Empty;
+        ClearDocumentPasswords();
+        OutputStrategy = state.OutputStrategy;
+        SelectionPreset = state.SelectionPreset;
+        PageSelectionInput = state.PageSelectionInput ?? string.Empty;
+
+        if (Pages.Count > 0 && state.Pages.Count > 0)
+        {
+            var savedPages = state.Pages.ToDictionary(page => page.SourcePageNumber);
+            var orderedPages = new List<PdfPageOrganizerItem>();
+
+            foreach (var savedPage in state.Pages)
+            {
+                var page = Pages.FirstOrDefault(item => item.SourcePageNumber == savedPage.SourcePageNumber);
+                if (page != null)
+                {
+                    orderedPages.Add(page);
+                }
+            }
+
+            orderedPages.AddRange(Pages.Where(page => !savedPages.ContainsKey(page.SourcePageNumber)));
+
+            _isApplyingSelectionPreset = true;
+            try
+            {
+                Pages.Clear();
+                for (var index = 0; index < orderedPages.Count; index++)
+                {
+                    var page = orderedPages[index];
+                    if (savedPages.TryGetValue(page.SourcePageNumber, out var pageState))
+                    {
+                        page.Rotation = pageState.Rotation;
+                        page.IsSelected = pageState.IsSelected;
+                    }
+                    else
+                    {
+                        page.Rotation = 0;
+                        page.IsSelected = false;
+                    }
+
+                    page.PageNumber = index + 1;
+                    Pages.Add(page);
+                }
+            }
+            finally
+            {
+                _isApplyingSelectionPreset = false;
+            }
+        }
+
+        LastOperationSucceeded = false;
+        StatusMessage = "Page Organizer session restored. Passwords must be re-entered.";
+        UpdateSelectionSummary();
+        UpdateNamingPreview();
+        UpdateValidationMessage();
+        RefreshCommands();
+    }
+
+    private string GetEffectiveAccessPassword()
+        => !string.IsNullOrWhiteSpace(DocumentOwnerPassword)
+            ? DocumentOwnerPassword
+            : DocumentPassword;
+
+    private bool CanAccessProtectedDocument()
+        => !_requiresDocumentPassword && !_isDocumentPasswordIncorrect && (!_isDocumentEncrypted || _hasOwnerLevelAccess);
+
+    private void UpdateDocumentSecurityState(PdfPageOrganizerDocumentInfo? info)
+    {
+        _isDocumentEncrypted = info?.IsEncrypted == true;
+        _requiresDocumentPassword = info?.RequiresPassword == true;
+        _isDocumentPasswordIncorrect = info?.IsPasswordIncorrect == true;
+        _hasOwnerLevelAccess = info?.HasOwnerPermissions != false;
+
+        DocumentEncryptionText = info == null
+            ? "Not loaded"
+            : !_isDocumentEncrypted
+                ? "Not encrypted"
+                : _hasOwnerLevelAccess
+                    ? "Encrypted - owner access granted"
+                    : "Encrypted - owner password required";
+
+        DocumentPasswordHint = info == null
+            ? "Load a PDF to inspect its protection status."
+            : _isDocumentPasswordIncorrect
+                ? "Incorrect password. Enter the correct password and reload the document."
+                : _requiresDocumentPassword
+                    ? "Enter the file password or owner password, then reload the document."
+                    : _isDocumentEncrypted && !_hasOwnerLevelAccess
+                        ? "This protected PDF needs the owner password before you can extract, remove, or rotate pages."
+                        : "This document is ready for page organizing.";
+
+        OnPropertyChanged(nameof(IsDocumentPasswordPanelVisible));
+    }
+
+    private void ClearDocumentPasswords()
+    {
+        DocumentPassword = string.Empty;
+        DocumentOwnerPassword = string.Empty;
+
+        if (_isDocumentEncrypted)
+        {
+            UpdateDocumentSecurityState(new PdfPageOrganizerDocumentInfo
+            {
+                IsEncrypted = true,
+                RequiresPassword = true,
+                HasOwnerPermissions = false,
+                StatusMessage = "Re-enter the owner password to continue organizing this protected PDF."
+            });
+            UpdateValidationMessage();
+        }
     }
 
     private static string FormatBytes(long bytes)

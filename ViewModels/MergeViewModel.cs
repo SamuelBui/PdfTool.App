@@ -5,6 +5,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Windows;
+using System.Windows.Threading;
 using System.Windows.Media;
 using Microsoft.Win32;
 using PdfTool.App.Commands;
@@ -23,6 +25,7 @@ public class MergeViewModel : BaseViewModel
     private readonly IRecentFilesService _recentFilesService;
     private readonly IPdfDocumentInspectorService _inspectorService;
     private readonly IPdfThumbnailService _thumbnailService;
+    private readonly Dispatcher _uiDispatcher;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _refreshLocks = new(StringComparer.OrdinalIgnoreCase);
     private Stack<MergeQueueSnapshot> _undoStack = new();
     private PdfFileItem? _selectedFile;
@@ -55,6 +58,7 @@ public class MergeViewModel : BaseViewModel
         _recentFilesService = recentFilesService;
         _inspectorService = inspectorService;
         _thumbnailService = thumbnailService;
+        _uiDispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
         RecentFiles = recentFilesService.Files;
 
         Files = new ObservableCollection<PdfFileItem>();
@@ -86,7 +90,14 @@ public class MergeViewModel : BaseViewModel
             {
                 RaisePreviewStateChanged();
                 RefreshCommands();
-                LoadPreviewAsync();
+                if (_isRestoringUndo)
+                {
+                    UpdatePreviewFromSelectedFileState();
+                }
+                else
+                {
+                    LoadPreviewAsync();
+                }
             }
         }
     }
@@ -423,7 +434,7 @@ public class MergeViewModel : BaseViewModel
 
         PushUndoState();
 
-        var targetIndex = targetPage == null ? parentFile.PageThumbnails.Count : parentFile.PageThumbnails.IndexOf(targetPage);
+        var targetIndex = targetPage == null ? parentFile.PageThumbnails.Count : parentFile.PageThumbnails.IndexOf(targetPage) + 1;
         if (targetIndex < 0)
         {
             targetIndex = parentFile.PageThumbnails.Count;
@@ -477,7 +488,7 @@ public class MergeViewModel : BaseViewModel
 
         PushUndoState();
 
-        var targetIndex = targetPage == null ? targetFile.PageThumbnails.Count : targetFile.PageThumbnails.IndexOf(targetPage);
+        var targetIndex = targetPage == null ? targetFile.PageThumbnails.Count : targetFile.PageThumbnails.IndexOf(targetPage) + 1;
         if (targetIndex < 0)
         {
             targetIndex = targetFile.PageThumbnails.Count;
@@ -520,7 +531,7 @@ public class MergeViewModel : BaseViewModel
 
         PushUndoState();
 
-        var targetIndex = targetPage == null ? targetFile.PageThumbnails.Count : targetFile.PageThumbnails.IndexOf(targetPage);
+        var targetIndex = targetPage == null ? targetFile.PageThumbnails.Count : targetFile.PageThumbnails.IndexOf(targetPage) + 1;
         if (targetIndex < 0)
         {
             targetIndex = targetFile.PageThumbnails.Count;
@@ -637,8 +648,10 @@ public class MergeViewModel : BaseViewModel
         _statusService.Start("Merging PDF files...");
         _statusService.Report("Validating queue...", 20);
 
-        var validation = await Task.Run(BuildValidationSummary);
-        ValidationSummaryText = $"{validation.TotalFiles} files: {validation.SummaryText}";
+        var validationInputs = CreateValidationWorkItems();
+        var validationOutcome = await Task.Run(() => EvaluateValidation(validationInputs));
+        ApplyValidationOutcome(validationOutcome);
+        var validation = validationOutcome.Summary;
 
         if (validation.HasBlockingIssues)
         {
@@ -676,6 +689,8 @@ public class MergeViewModel : BaseViewModel
             _statusService.Fail("Merge PDF failed.");
             AddReport("Merge", string.Join(" | ", inputFiles.Select(x => x.FilePath)), OutputPath, "Failed", result.Message);
         }
+
+        ClearSensitiveMergeState();
     }
 
     private void Undo()
@@ -762,14 +777,7 @@ public class MergeViewModel : BaseViewModel
     {
         if (SelectedFile == null)
         {
-            PreviewFileName = "-";
-            PreviewFilePath = string.Empty;
-            PreviewPageCount = "-";
-            PreviewFileSize = "-";
-            PreviewEncryption = "-";
-            PreviewCoverThumbnail = null;
-            PreviewStatus = "Select a file to preview its details.";
-            RaisePreviewStateChanged();
+            UpdatePreviewFromSelectedFileState();
             return;
         }
 
@@ -780,7 +788,10 @@ public class MergeViewModel : BaseViewModel
         PreviewStatus = "Loading preview...";
         RaisePreviewStateChanged();
 
-        await RefreshQueueItemAsync(selectedFile, loadThumbnail: true, refreshValidation: false);
+        if (selectedFile.PageThumbnails.Count == 0)
+        {
+            await RefreshQueueItemAsync(selectedFile, loadThumbnail: true, refreshValidation: false);
+        }
 
         if (!ReferenceEquals(SelectedFile, selectedFile))
         {
@@ -832,6 +843,40 @@ public class MergeViewModel : BaseViewModel
         RaisePreviewStateChanged();
     }
 
+    private void UpdatePreviewFromSelectedFileState()
+    {
+        if (SelectedFile == null)
+        {
+            PreviewFileName = "-";
+            PreviewFilePath = string.Empty;
+            PreviewPageCount = "-";
+            PreviewFileSize = "-";
+            PreviewEncryption = "-";
+            PreviewCoverThumbnail = null;
+            PreviewStatus = "Select a file to preview its details.";
+            RaisePreviewStateChanged();
+            return;
+        }
+
+        var selectedFile = SelectedFile;
+        PreviewFileName = selectedFile.FileName;
+        PreviewFilePath = selectedFile.FilePath;
+        PreviewPageCount = selectedFile.PageCount?.ToString(CultureInfo.InvariantCulture) ?? "Unavailable";
+        PreviewFileSize = File.Exists(selectedFile.FilePath)
+            ? FormatFileSize(new FileInfo(selectedFile.FilePath).Length)
+            : "Unavailable";
+        PreviewEncryption = selectedFile.IsEncrypted
+            ? selectedFile.RequiresPassword || selectedFile.IsPasswordIncorrect
+                ? "Encrypted (locked)"
+                : "Encrypted (unlocked)"
+            : "Not encrypted";
+
+        PreviewCoverThumbnail = selectedFile.PageThumbnails.Select(page => page.Thumbnail).FirstOrDefault(thumbnail => thumbnail != null)
+                              ?? selectedFile.Thumbnail;
+        PreviewStatus = selectedFile.ValidationMessage;
+        RaisePreviewStateChanged();
+    }
+
     private async void ReloadSelectedPreview()
     {
         if (SelectedFile == null)
@@ -845,50 +890,69 @@ public class MergeViewModel : BaseViewModel
 
     private void ValidateQueue()
     {
-        var summary = BuildValidationSummary();
-        ValidationSummaryText = $"{summary.TotalFiles} files: {summary.SummaryText}";
-        RaisePreviewStateChanged();
-        RaiseMergeQueueStateChanged();
+        var validationOutcome = EvaluateValidation(CreateValidationWorkItems());
+        ApplyValidationOutcome(validationOutcome);
     }
 
-    private MergeValidationSummary BuildValidationSummary()
+    private List<MergeValidationWorkItem> CreateValidationWorkItems()
     {
-        var summary = new MergeValidationSummary
-        {
-            TotalFiles = Files.Count
-        };
-
         var duplicatePaths = Files
             .GroupBy(file => file.FilePath, StringComparer.OrdinalIgnoreCase)
             .Where(group => group.Count() > 1)
             .Select(group => group.Key)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var file in Files)
-        {
-            file.IsDuplicate = duplicatePaths.Contains(file.FilePath);
-            file.IsLocked = false;
-            file.RequiresPassword = false;
-            file.IsPasswordIncorrect = false;
-            file.IsValidPdf = true;
+        return Files
+            .Select(file => new MergeValidationWorkItem(
+                file,
+                file.FilePath,
+                file.Password,
+                duplicatePaths.Contains(file.FilePath)))
+            .ToList();
+    }
 
-            if (file.IsDuplicate)
+    private MergeValidationOutcome EvaluateValidation(IReadOnlyList<MergeValidationWorkItem> items)
+    {
+        var summary = new MergeValidationSummary
+        {
+            TotalFiles = items.Count
+        };
+
+        var results = new List<MergeValidationResult>(items.Count);
+
+        foreach (var item in items)
+        {
+            if (item.IsDuplicate)
             {
                 summary.DuplicateFiles++;
-                file.ValidationMessage = "Duplicate file in queue. Remove the extra copy.";
+                results.Add(new MergeValidationResult(
+                    item.File,
+                    item.IsDuplicate,
+                    IsLocked: false,
+                    AccessError: null,
+                    Info: null));
                 continue;
             }
 
-            if (!FileAccessHelper.TryValidateReadableFile(file.FilePath, out var inputError))
+            if (!FileAccessHelper.TryValidateReadableFile(item.FilePath, out var inputError))
             {
                 summary.LockedFiles++;
-                file.IsLocked = true;
-                file.ValidationMessage = inputError;
+                results.Add(new MergeValidationResult(
+                    item.File,
+                    item.IsDuplicate,
+                    IsLocked: true,
+                    AccessError: inputError,
+                    Info: null));
                 continue;
             }
 
-            var info = _inspectorService.Inspect(file.FilePath, file.Password);
-            ApplyInspection(file, info);
+            var info = _inspectorService.Inspect(item.FilePath, item.Password);
+            results.Add(new MergeValidationResult(
+                item.File,
+                item.IsDuplicate,
+                IsLocked: false,
+                AccessError: null,
+                Info: info));
 
             if (!info.IsPdf)
             {
@@ -911,7 +975,50 @@ public class MergeViewModel : BaseViewModel
             summary.ReadyFiles++;
         }
 
-        return summary;
+        return new MergeValidationOutcome(summary, results);
+    }
+
+    private void ApplyValidationOutcome(MergeValidationOutcome outcome)
+    {
+        RunOnUiThread(() =>
+        {
+            foreach (var result in outcome.Results)
+            {
+                if (!Files.Contains(result.File))
+                {
+                    continue;
+                }
+
+                var file = result.File;
+                file.IsDuplicate = result.IsDuplicate;
+            file.IsLocked = false;
+            file.RequiresPassword = false;
+            file.IsPasswordIncorrect = false;
+            file.IsValidPdf = true;
+
+                if (file.IsDuplicate)
+                {
+                    file.ValidationMessage = "Duplicate file in queue. Remove the extra copy.";
+                    continue;
+                }
+
+                if (result.IsLocked)
+                {
+                    file.IsLocked = true;
+                    file.ValidationMessage = result.AccessError ?? "File is unavailable.";
+                    continue;
+                }
+
+                if (result.Info != null)
+                {
+                    ApplyInspection(file, result.Info);
+                }
+            }
+
+            ValidationSummaryText = $"{outcome.Summary.TotalFiles} files: {outcome.Summary.SummaryText}";
+            RaisePreviewStateChanged();
+            RaiseMergeQueueStateChanged();
+        });
     }
 
     private async void RefreshQueueItemsAsync(IReadOnlyList<PdfFileItem> items)
@@ -1093,6 +1200,12 @@ public class MergeViewModel : BaseViewModel
 
     private void RaisePreviewStateChanged()
     {
+        if (!CheckAccess())
+        {
+            RunOnUiThread(RaisePreviewStateChanged);
+            return;
+        }
+
         OnPropertyChanged(nameof(IsPreviewPasswordPanelVisible));
         OnPropertyChanged(nameof(PreviewPasswordHint));
         ReloadSelectedPreviewCommand.RaiseCanExecuteChanged();
@@ -1152,6 +1265,135 @@ public class MergeViewModel : BaseViewModel
                     page.HeightPoints,
                     page.IsSelected,
                     page.Thumbnail)).ToList())).ToList());
+    }
+
+    public MergeSessionState CaptureSessionState()
+    {
+        return new MergeSessionState
+        {
+            OutputPath = OutputPath,
+            LastOutputPath = LastOutputPath,
+            SelectedFileIndex = SelectedFile != null ? Files.IndexOf(SelectedFile) : -1,
+            Files = Files.Select(file => new MergeFileSessionState
+            {
+                FilePath = file.FilePath,
+                PageCount = file.PageCount,
+                IsEncrypted = file.IsEncrypted,
+                RequiresPassword = file.RequiresPassword,
+                IsPasswordIncorrect = file.IsPasswordIncorrect,
+                IsLocked = file.IsLocked,
+                IsDuplicate = file.IsDuplicate,
+                IsValidPdf = file.IsValidPdf,
+                ValidationMessage = file.ValidationMessage,
+                Pages = file.PageThumbnails.Select(page => new MergePageSessionState
+                {
+                    PageNumber = page.PageNumber,
+                    SourcePageNumber = page.SourcePageNumber,
+                    SourceFilePath = page.SourceFilePath,
+                    Rotation = page.Rotation,
+                    WidthPoints = page.WidthPoints,
+                    HeightPoints = page.HeightPoints,
+                    IsSelected = page.IsSelected
+                }).ToList()
+            }).ToList()
+        };
+    }
+
+    public void RestoreSessionState(MergeSessionState? state)
+    {
+        if (state == null)
+        {
+            return;
+        }
+
+        _isRestoringUndo = true;
+
+        try
+        {
+            ClearDropTargets();
+            Files.Clear();
+
+            foreach (var fileState in state.Files)
+            {
+                var file = new PdfFileItem
+                {
+                    FilePath = fileState.FilePath,
+                    PageCount = fileState.PageCount,
+                    IsEncrypted = fileState.IsEncrypted,
+                    RequiresPassword = fileState.RequiresPassword,
+                    IsPasswordIncorrect = fileState.IsPasswordIncorrect,
+                    IsLocked = fileState.IsLocked,
+                    IsDuplicate = fileState.IsDuplicate,
+                    IsValidPdf = fileState.IsValidPdf,
+                    ValidationMessage = fileState.ValidationMessage
+                };
+
+                foreach (var pageState in fileState.Pages)
+                {
+                    file.PageThumbnails.Add(new PdfPageOrganizerItem
+                    {
+                        PageNumber = pageState.PageNumber,
+                        SourcePageNumber = pageState.SourcePageNumber,
+                        SourceFilePath = pageState.SourceFilePath,
+                        WidthPoints = pageState.WidthPoints,
+                        HeightPoints = pageState.HeightPoints,
+                        Rotation = pageState.Rotation,
+                        IsSelected = pageState.IsSelected
+                    });
+                }
+
+                NormalizePageSequence(file);
+                Files.Add(file);
+            }
+
+            OutputPath = state.OutputPath ?? string.Empty;
+            LastOutputPath = state.LastOutputPath ?? string.Empty;
+            _undoStack.Clear();
+            SelectedFile = state.SelectedFileIndex >= 0 && state.SelectedFileIndex < Files.Count
+                ? Files[state.SelectedFileIndex]
+                : Files.FirstOrDefault();
+
+            ValidateQueue();
+            StatusMessage = Files.Count == 0 ? "Merge session restored." : "Merge queue session restored. Passwords must be re-entered.";
+            LastOperationSucceeded = false;
+            RefreshCommands();
+        }
+        finally
+        {
+            _isRestoringUndo = false;
+        }
+
+        _ = RefreshRestoredQueueThumbnailsAsync(Files.ToList());
+    }
+
+    private async Task RefreshRestoredQueueThumbnailsAsync(IReadOnlyList<PdfFileItem> files)
+    {
+        var pageGroups = files
+            .SelectMany(file => file.PageThumbnails)
+            .Where(page => !string.IsNullOrWhiteSpace(page.SourceFilePath) && File.Exists(page.SourceFilePath))
+            .GroupBy(page => (page.SourceFilePath, page.SourcePassword));
+
+        foreach (var group in pageGroups)
+        {
+            var thumbnails = await Task.Run(() =>
+                _thumbnailService.RenderDocumentThumbnails(group.Key.SourceFilePath, 72, 92, null, group.Key.SourcePassword));
+            var thumbnailMap = thumbnails.ToDictionary(item => item.PageNumber, item => item.Thumbnail);
+
+            foreach (var page in group)
+            {
+                if (thumbnailMap.TryGetValue(page.SourcePageNumber, out var thumbnail))
+                {
+                    page.Thumbnail = thumbnail;
+                }
+            }
+        }
+
+        foreach (var file in files)
+        {
+            NormalizePageSequence(file);
+        }
+
+        UpdatePreviewFromSelectedFileState();
     }
 
     private void Files_OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -1231,6 +1473,12 @@ public class MergeViewModel : BaseViewModel
 
     private void File_OnPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (!CheckAccess())
+        {
+            RunOnUiThread(() => File_OnPropertyChanged(sender, e));
+            return;
+        }
+
         if (sender is not PdfFileItem file)
         {
             return;
@@ -1251,6 +1499,12 @@ public class MergeViewModel : BaseViewModel
 
     private void Page_OnPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (!CheckAccess())
+        {
+            RunOnUiThread(() => Page_OnPropertyChanged(sender, e));
+            return;
+        }
+
         if (e.PropertyName == nameof(PdfPageOrganizerItem.IsSelected) ||
             e.PropertyName == nameof(PdfPageOrganizerItem.PageNumber) ||
             e.PropertyName == nameof(PdfPageOrganizerItem.Rotation))
@@ -1261,14 +1515,34 @@ public class MergeViewModel : BaseViewModel
 
     private void UpdateSourcePasswords(PdfFileItem file)
     {
-        foreach (var page in file.PageThumbnails)
+        foreach (var queueFile in Files)
         {
-            if (string.IsNullOrWhiteSpace(page.SourceFilePath) ||
-                string.Equals(page.SourceFilePath, file.FilePath, StringComparison.OrdinalIgnoreCase))
+            foreach (var page in queueFile.PageThumbnails)
             {
-                page.SourcePassword = file.Password;
+                if (string.IsNullOrWhiteSpace(page.SourceFilePath) ||
+                    string.Equals(page.SourceFilePath, file.FilePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    page.SourcePassword = file.Password;
+                }
             }
         }
+    }
+
+    private void ClearSensitiveMergeState()
+    {
+        foreach (var file in Files)
+        {
+            file.Password = string.Empty;
+
+            foreach (var page in file.PageThumbnails)
+            {
+                page.SourcePassword = string.Empty;
+            }
+        }
+
+        _undoStack.Clear();
+        RaisePreviewStateChanged();
+        RaiseMergeQueueStateChanged();
     }
 
     private int GetTotalPageCount()
@@ -1276,6 +1550,12 @@ public class MergeViewModel : BaseViewModel
 
     private void RaiseMergeQueueStateChanged()
     {
+        if (!CheckAccess())
+        {
+            RunOnUiThread(RaiseMergeQueueStateChanged);
+            return;
+        }
+
         OnPropertyChanged(nameof(QueueSummaryText));
         RefreshCommands();
     }
@@ -1302,6 +1582,12 @@ public class MergeViewModel : BaseViewModel
 
     private void RefreshCommands()
     {
+        if (!CheckAccess())
+        {
+            RunOnUiThread(RefreshCommands);
+            return;
+        }
+
         AddFilesCommand.RaiseCanExecuteChanged();
         BrowseOutputCommand.RaiseCanExecuteChanged();
         MergeCommand.RaiseCanExecuteChanged();
@@ -1311,6 +1597,19 @@ public class MergeViewModel : BaseViewModel
         OpenOutputFolderCommand.RaiseCanExecuteChanged();
         OpenSelectedOutputCommand.RaiseCanExecuteChanged();
         ReloadSelectedPreviewCommand.RaiseCanExecuteChanged();
+    }
+
+    private bool CheckAccess() => _uiDispatcher.CheckAccess();
+
+    private void RunOnUiThread(Action action)
+    {
+        if (CheckAccess())
+        {
+            action();
+            return;
+        }
+
+        _uiDispatcher.Invoke(action);
     }
 
     private sealed record MergeQueueSnapshot(
@@ -1332,6 +1631,23 @@ public class MergeViewModel : BaseViewModel
         bool IsValidPdf,
         string ValidationMessage,
         IReadOnlyList<MergePageSnapshot> Pages);
+
+    private sealed record MergeValidationWorkItem(
+        PdfFileItem File,
+        string FilePath,
+        string Password,
+        bool IsDuplicate);
+
+    private sealed record MergeValidationResult(
+        PdfFileItem File,
+        bool IsDuplicate,
+        bool IsLocked,
+        string? AccessError,
+        PdfDocumentInfo? Info);
+
+    private sealed record MergeValidationOutcome(
+        MergeValidationSummary Summary,
+        IReadOnlyList<MergeValidationResult> Results);
 
     private sealed record MergePageSnapshot(
         int PageNumber,

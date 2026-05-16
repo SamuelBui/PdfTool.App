@@ -8,30 +8,68 @@ namespace PdfTool.App.Services;
 
 public class PdfSplitService : IPdfSplitService
 {
-    public PdfPageOrganizerDocumentInfo LoadDocumentInfo(string inputPath)
+    private readonly IAppLogger _logger;
+
+    public PdfSplitService(IAppLogger logger)
+    {
+        _logger = logger;
+    }
+
+    public PdfPageOrganizerDocumentInfo LoadDocumentInfo(string inputPath, string? password = null)
     {
         var result = new PdfPageOrganizerDocumentInfo();
 
         if (!FileAccessHelper.TryValidateReadableFile(inputPath, out _))
         {
+            result.StatusMessage = "Input PDF is currently open or locked by another process. Close the file, then try again.";
             return result;
         }
 
-        using var source = PdfReader.Open(inputPath, PdfDocumentOpenMode.Import);
-        result.PageCount = source.PageCount;
-
-        for (var index = 0; index < source.PageCount; index++)
+        try
         {
-            var page = source.Pages[index];
-            result.Pages.Add(new PdfPageOrganizerItem
+            if (PdfReader.TestPdfFile(inputPath) <= 0)
             {
-                PageNumber = index + 1,
-                SourcePageNumber = index + 1,
-                SourceFilePath = inputPath,
-                WidthPoints = page.Width.Point,
-                HeightPoints = page.Height.Point,
-                Rotation = page.Rotate
-            });
+                result.IsValidPdf = false;
+                result.StatusMessage = "Input file is not a valid PDF.";
+                return result;
+            }
+
+            using var source = string.IsNullOrWhiteSpace(password)
+                ? PdfReader.Open(inputPath, PdfDocumentOpenMode.Import)
+                : PdfReader.Open(inputPath, password, PdfDocumentOpenMode.Import, new PdfReaderOptions());
+            result.PageCount = source.PageCount;
+            result.IsEncrypted = source.SecuritySettings.IsEncrypted;
+            result.HasOwnerPermissions = PdfSecurityAccessHelper.HasOwnerPermissions(source, password);
+            result.CanReadContents = true;
+            result.StatusMessage = "Ready";
+
+            for (var index = 0; index < source.PageCount; index++)
+            {
+                var page = source.Pages[index];
+                result.Pages.Add(new PdfPageOrganizerItem
+                {
+                    PageNumber = index + 1,
+                    SourcePageNumber = index + 1,
+                    SourceFilePath = inputPath,
+                    WidthPoints = page.Width.Point,
+                    HeightPoints = page.Height.Point,
+                    Rotation = page.Rotate
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            var isPasswordRelated = ex.Message.Contains("password", StringComparison.OrdinalIgnoreCase)
+                                    || ex.Message.Contains("encrypted", StringComparison.OrdinalIgnoreCase)
+                                    || ex.Message.Contains("decrypt", StringComparison.OrdinalIgnoreCase);
+            result.IsEncrypted = isPasswordRelated;
+            result.RequiresPassword = isPasswordRelated;
+            result.IsPasswordIncorrect = isPasswordRelated && !string.IsNullOrWhiteSpace(password);
+            result.StatusMessage = isPasswordRelated
+                ? string.IsNullOrWhiteSpace(password)
+                    ? "Input PDF is protected and requires a password before organizing pages."
+                    : "Incorrect password for this protected PDF."
+                : $"Unable to read PDF pages: {ex.Message}";
         }
 
         return result;
@@ -50,6 +88,7 @@ public class PdfSplitService : IPdfSplitService
     {
         try
         {
+            _logger.LogInfo($"Split by ranges start. Input='{inputPath}', OutputFolder='{outputFolder}', Ranges='{pageRanges}'.");
             if (!FileAccessHelper.TryValidateReadableFile(inputPath, out var inputError))
             {
                 return OperationResult.Fail(inputError);
@@ -62,7 +101,7 @@ public class PdfSplitService : IPdfSplitService
 
             Directory.CreateDirectory(outputFolder);
 
-            using var source = PdfReader.Open(inputPath, PdfDocumentOpenMode.Import);
+            using var source = OpenInputDocument(inputPath, null);
             var parsedRanges = PageRangeParser.Parse(pageRanges, source.PageCount);
             var outputs = new List<string>();
             var baseName = Path.GetFileNameWithoutExtension(inputPath);
@@ -76,10 +115,11 @@ public class PdfSplitService : IPdfSplitService
                 }
 
                 var outputPath = Path.Combine(outputFolder, CreateRangeFileName(baseName, range));
-                target.Save(outputPath);
+                SaveDocumentSafely(target, outputPath, "split-range");
                 outputs.Add(outputPath);
             }
 
+            _logger.LogInfo($"Split by ranges success. Input='{inputPath}', FilesCreated={outputs.Count}.");
             return new OperationResult
             {
                 Success = true,
@@ -89,6 +129,7 @@ public class PdfSplitService : IPdfSplitService
         }
         catch (Exception ex)
         {
+            _logger.LogError($"Split by ranges failed. Input='{inputPath}', OutputFolder='{outputFolder}'.", ex);
             return OperationResult.Fail($"Split by ranges failed: {ex.Message}");
         }
     }
@@ -97,6 +138,7 @@ public class PdfSplitService : IPdfSplitService
     {
         try
         {
+            _logger.LogInfo($"Extract selected start. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}'.");
             if (!TryValidateOptions(options, requireSelection: true, out var validationError))
             {
                 return OperationResult.Fail(validationError);
@@ -108,7 +150,12 @@ public class PdfSplitService : IPdfSplitService
                 .Distinct()
                 .ToList();
 
-            using var source = PdfReader.Open(options.InputPath, PdfDocumentOpenMode.Import);
+            using var source = OpenInputDocument(options.InputPath, options.Password);
+            if (!TryValidatePageConfiguration(source, options, requireSelection: true, out validationError))
+            {
+                return OperationResult.Fail(validationError);
+            }
+
             var baseName = Path.GetFileNameWithoutExtension(options.InputPath);
             var outputs = new List<string>();
 
@@ -122,7 +169,7 @@ public class PdfSplitService : IPdfSplitService
                         ApplyConfiguredRotation(page, pageNumber, options);
 
                         var outputPath = Path.Combine(options.OutputFolder, $"{baseName}_page_{pageNumber:000}.pdf");
-                        target.Save(outputPath);
+                        SaveDocumentSafely(target, outputPath, "extract-page");
                         outputs.Add(outputPath);
                     }
 
@@ -139,7 +186,7 @@ public class PdfSplitService : IPdfSplitService
                         }
 
                         var outputPath = Path.Combine(options.OutputFolder, CreateRangeFileName(baseName, range));
-                        target.Save(outputPath);
+                        SaveDocumentSafely(target, outputPath, "extract-range");
                         outputs.Add(outputPath);
                     }
 
@@ -155,7 +202,7 @@ public class PdfSplitService : IPdfSplitService
                         }
 
                         var outputPath = Path.Combine(options.OutputFolder, $"{baseName}_selected.pdf");
-                        target.Save(outputPath);
+                        SaveDocumentSafely(target, outputPath, "extract-selection");
                         outputs.Add(outputPath);
                     }
 
@@ -171,6 +218,7 @@ public class PdfSplitService : IPdfSplitService
         }
         catch (Exception ex)
         {
+            _logger.LogError($"Extract selected failed. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}'.", ex);
             return OperationResult.Fail($"Extract failed: {ex.Message}");
         }
     }
@@ -179,6 +227,7 @@ public class PdfSplitService : IPdfSplitService
     {
         try
         {
+            _logger.LogInfo($"Remove selected start. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}'.");
             if (!TryValidateOptions(options, requireSelection: true, out var validationError))
             {
                 return OperationResult.Fail(validationError);
@@ -186,7 +235,12 @@ public class PdfSplitService : IPdfSplitService
 
             Directory.CreateDirectory(options.OutputFolder);
 
-            using var source = PdfReader.Open(options.InputPath, PdfDocumentOpenMode.Import);
+            using var source = OpenInputDocument(options.InputPath, options.Password);
+            if (!TryValidatePageConfiguration(source, options, requireSelection: true, out validationError))
+            {
+                return OperationResult.Fail(validationError);
+            }
+
             var selectedPages = options.SelectedPages.Distinct().ToHashSet();
             var pageSequence = options.PageSequence.Count > 0
                 ? options.PageSequence
@@ -209,7 +263,7 @@ public class PdfSplitService : IPdfSplitService
 
             var baseName = Path.GetFileNameWithoutExtension(options.InputPath);
             var outputPath = Path.Combine(options.OutputFolder, $"{baseName}_without_selected.pdf");
-            target.Save(outputPath);
+            SaveDocumentSafely(target, outputPath, "remove-selected");
 
             return new OperationResult
             {
@@ -221,6 +275,7 @@ public class PdfSplitService : IPdfSplitService
         }
         catch (Exception ex)
         {
+            _logger.LogError($"Remove selected failed. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}'.", ex);
             return OperationResult.Fail($"Remove selected pages failed: {ex.Message}");
         }
     }
@@ -229,6 +284,7 @@ public class PdfSplitService : IPdfSplitService
     {
         try
         {
+            _logger.LogInfo($"Rotate selected start. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}', Delta={options.RotationDelta}.");
             if (!TryValidateOptions(options, requireSelection: true, out var validationError))
             {
                 return OperationResult.Fail(validationError);
@@ -236,7 +292,12 @@ public class PdfSplitService : IPdfSplitService
 
             Directory.CreateDirectory(options.OutputFolder);
 
-            using var source = PdfReader.Open(options.InputPath, PdfDocumentOpenMode.Import);
+            using var source = OpenInputDocument(options.InputPath, options.Password);
+            if (!TryValidatePageConfiguration(source, options, requireSelection: true, out validationError))
+            {
+                return OperationResult.Fail(validationError);
+            }
+
             using var target = new PdfDocument();
             var selectedPages = options.SelectedPages.Distinct().ToHashSet();
 
@@ -255,7 +316,7 @@ public class PdfSplitService : IPdfSplitService
             var baseName = Path.GetFileNameWithoutExtension(options.InputPath);
             var suffix = options.RotationDelta >= 0 ? "rotated_right" : "rotated_left";
             var outputPath = Path.Combine(options.OutputFolder, $"{baseName}_{suffix}.pdf");
-            target.Save(outputPath);
+            SaveDocumentSafely(target, outputPath, "rotate-pages");
 
             return new OperationResult
             {
@@ -267,9 +328,32 @@ public class PdfSplitService : IPdfSplitService
         }
         catch (Exception ex)
         {
+            _logger.LogError($"Rotate selected failed. Input='{options.InputPath}', OutputFolder='{options.OutputFolder}'.", ex);
             return OperationResult.Fail($"Rotate selected pages failed: {ex.Message}");
         }
     }
+
+    private static void SaveDocumentSafely(PdfDocument document, string outputPath, string operationTag)
+    {
+        string? tempOutputPath = null;
+
+        try
+        {
+            tempOutputPath = SafeFileWriteHelper.CreateTemporaryOutputPath(outputPath, operationTag);
+            document.Save(tempOutputPath);
+            SafeFileWriteHelper.CommitTemporaryFile(tempOutputPath, outputPath);
+            tempOutputPath = null;
+        }
+        finally
+        {
+            SafeFileWriteHelper.TryDeleteTemporaryFile(tempOutputPath);
+        }
+    }
+
+    private static PdfSharp.Pdf.PdfDocument OpenInputDocument(string inputPath, string? password)
+        => string.IsNullOrWhiteSpace(password)
+            ? PdfReader.Open(inputPath, PdfDocumentOpenMode.Import)
+            : PdfReader.Open(inputPath, password, PdfDocumentOpenMode.Import, new PdfReaderOptions());
 
     private static void ApplyConfiguredRotation(PdfPage page, int pageNumber, PdfSplitOperationOptions options)
     {
@@ -297,6 +381,45 @@ public class PdfSplitService : IPdfSplitService
         {
             validationError = "Please select at least one page.";
             return false;
+        }
+
+        validationError = string.Empty;
+        return true;
+    }
+
+    private static bool TryValidatePageConfiguration(PdfDocument source, PdfSplitOperationOptions options, bool requireSelection, out string validationError)
+    {
+        var invalidSelectedPages = options.SelectedPages
+            .Where(page => page < 1 || page > source.PageCount)
+            .Distinct()
+            .OrderBy(page => page)
+            .ToList();
+
+        if (requireSelection && invalidSelectedPages.Count > 0)
+        {
+            validationError = $"Selected page(s) out of range: {string.Join(", ", invalidSelectedPages)}.";
+            return false;
+        }
+
+        if (options.PageSequence.Count > 0)
+        {
+            var invalidSequencePages = options.PageSequence
+                .Where(page => page < 1 || page > source.PageCount)
+                .Distinct()
+                .OrderBy(page => page)
+                .ToList();
+
+            if (invalidSequencePages.Count > 0)
+            {
+                validationError = $"Page order contains out-of-range page(s): {string.Join(", ", invalidSequencePages)}.";
+                return false;
+            }
+
+            if (options.PageSequence.Distinct().Count() != options.PageSequence.Count)
+            {
+                validationError = "Page order contains duplicate entries.";
+                return false;
+            }
         }
 
         validationError = string.Empty;

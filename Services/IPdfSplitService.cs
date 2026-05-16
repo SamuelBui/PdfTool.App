@@ -4,7 +4,7 @@ namespace PdfTool.App.Services;
 
 public interface IPdfSplitService
 {
-    PdfPageOrganizerDocumentInfo LoadDocumentInfo(string inputPath);
+    PdfPageOrganizerDocumentInfo LoadDocumentInfo(string inputPath, string? password = null);
     OperationResult SplitEveryPage(string inputPath, string outputFolder);
     OperationResult SplitByRanges(string inputPath, string outputFolder, string pageRanges);
     OperationResult ExtractSelectedPages(PdfSplitOperationOptions options);

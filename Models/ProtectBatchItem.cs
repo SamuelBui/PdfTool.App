@@ -8,8 +8,10 @@ public class ProtectBatchItem : BaseViewModel
     private string _inputPath = string.Empty;
     private string _outputPath = string.Empty;
     private string _password = string.Empty;
+    private string _ownerPassword = string.Empty;
     private string _status = "Pending";
     private bool _isPasswordVisible;
+    private bool _isOwnerPasswordVisible;
     private bool _hasValidationError;
     private bool _hasValidationWarning;
 
@@ -45,6 +47,18 @@ public class ProtectBatchItem : BaseViewModel
         }
     }
 
+    public string OwnerPassword
+    {
+        get => _ownerPassword;
+        set
+        {
+            if (SetProperty(ref _ownerPassword, value))
+            {
+                OnPropertyChanged(nameof(MaskedOwnerPassword));
+            }
+        }
+    }
+
     public string Status
     {
         get => _status;
@@ -64,6 +78,12 @@ public class ProtectBatchItem : BaseViewModel
         set => SetProperty(ref _isPasswordVisible, value);
     }
 
+    public bool IsOwnerPasswordVisible
+    {
+        get => _isOwnerPasswordVisible;
+        set => SetProperty(ref _isOwnerPasswordVisible, value);
+    }
+
     public bool HasValidationError
     {
         get => _hasValidationError;
@@ -77,4 +97,5 @@ public class ProtectBatchItem : BaseViewModel
     }
 
     public string MaskedPassword => string.IsNullOrEmpty(Password) ? string.Empty : new string('\u2022', Password.Length);
+    public string MaskedOwnerPassword => string.IsNullOrEmpty(OwnerPassword) ? string.Empty : new string('\u2022', OwnerPassword.Length);
 }

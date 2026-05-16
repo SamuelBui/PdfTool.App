@@ -33,6 +33,7 @@ public class ProtectViewModel : BaseViewModel
     private bool _allowAssembleDocument = true;
     private bool _isBusy;
     private RecentFileItem? _selectedRecentFile;
+    private ProtectActionMode _actionMode = ProtectActionMode.Protect;
     private ProtectInputMode _inputMode = ProtectInputMode.SingleFile;
     private BatchPasswordStrategy _batchPasswordStrategy = BatchPasswordStrategy.OnePasswordForAll;
     private string _batchSourceFolder = string.Empty;
@@ -53,6 +54,7 @@ public class ProtectViewModel : BaseViewModel
     private string _commonPasswordStrengthLabel = "Empty";
     private string _commonPasswordStrengthGuidance = "Use one shared password for all loaded files.";
     private ProtectBatchItem? _selectedBatchItem;
+    private bool _suppressBatchValidationRefresh;
 
     public ProtectViewModel(
         IPdfProtectionService service,
@@ -75,7 +77,7 @@ public class ProtectViewModel : BaseViewModel
         ProtectCommand = new RelayCommand(ProtectPdf, CanProtect);
         UseRecentFileCommand = new RelayCommand(UseRecentFile, () => SelectedRecentFile != null && !IsBusy && IsSingleMode);
         ApplySamePasswordCommand = new RelayCommand(ApplySamePasswordToAll, () => !IsBusy && BatchItems.Count > 0 && !string.IsNullOrWhiteSpace(BatchCommonPassword));
-        GeneratePasswordsCommand = new RelayCommand(GeneratePasswords, () => !IsBusy && BatchItems.Count > 0);
+        GeneratePasswordsCommand = new RelayCommand(GeneratePasswords, () => !IsBusy && BatchItems.Count > 0 && IsProtectAction);
         ImportMappingCommand = new RelayCommand(ImportMapping, () => !IsBusy && BatchItems.Count > 0);
         ExportTemplateCommand = new RelayCommand(ExportTemplate, () => BatchItems.Count > 0);
         ExportBatchInfoCommand = new RelayCommand(ExportBatchInfo, () => BatchItems.Count > 0);
@@ -84,6 +86,7 @@ public class ProtectViewModel : BaseViewModel
         ClearAllPasswordsCommand = new RelayCommand(ClearAllPasswords, () => !IsBusy && (HasAnyPasswordValues()));
         SelectBatchOutputFolderCommand = new RelayCommand(SelectBatchOutputFolder, () => !IsBusy && !IsSingleMode && BatchItems.Count > 0);
         ToggleBatchItemPasswordVisibilityCommand = new RelayCommand<ProtectBatchItem>(ToggleBatchItemPasswordVisibility);
+        ToggleBatchItemOwnerPasswordVisibilityCommand = new RelayCommand<ProtectBatchItem>(ToggleBatchItemOwnerPasswordVisibility);
         AddBatchFilesCommand = new RelayCommand(AddBatchFiles, () => !IsBusy && !IsSingleMode);
         RemoveSelectedBatchItemCommand = new RelayCommand(RemoveSelectedBatchItem, () => !IsBusy && SelectedBatchItem != null);
 
@@ -101,7 +104,7 @@ public class ProtectViewModel : BaseViewModel
             {
                 if (string.IsNullOrWhiteSpace(OutputPath) && !string.IsNullOrWhiteSpace(value))
                 {
-                    OutputPath = FileNameHelper.CreateProtectedFilePath(value);
+                    OutputPath = CreateDefaultOutputPath(value);
                 }
 
                 RefreshCommands();
@@ -254,6 +257,50 @@ public class ProtectViewModel : BaseViewModel
         }
     }
 
+    public ProtectActionMode ActionMode
+    {
+        get => _actionMode;
+        set
+        {
+            if (SetProperty(ref _actionMode, value))
+            {
+                OnPropertyChanged(nameof(IsProtectAction));
+                OnPropertyChanged(nameof(IsUnlockAction));
+                OnPropertyChanged(nameof(PrimaryPasswordLabel));
+                OnPropertyChanged(nameof(ExecuteActionLabel));
+                OnPropertyChanged(nameof(BatchModeTitle));
+                UpdateOutputPathsForActionMode();
+                UpdateUserPasswordStrength();
+                UpdateCommonPasswordStrength();
+                RefreshCommands();
+            }
+        }
+    }
+
+    public bool IsProtectAction
+    {
+        get => ActionMode == ProtectActionMode.Protect;
+        set
+        {
+            if (value)
+            {
+                ActionMode = ProtectActionMode.Protect;
+            }
+        }
+    }
+
+    public bool IsUnlockAction
+    {
+        get => ActionMode == ProtectActionMode.Unlock;
+        set
+        {
+            if (value)
+            {
+                ActionMode = ProtectActionMode.Unlock;
+            }
+        }
+    }
+
     public ProtectInputMode InputMode
     {
         get => _inputMode;
@@ -355,6 +402,10 @@ public class ProtectViewModel : BaseViewModel
             }
         }
     }
+
+    public string PrimaryPasswordLabel => IsProtectAction ? "User password:" : "Owner password:";
+    public string ExecuteActionLabel => IsProtectAction ? "Protect PDF" : "Unlock PDF";
+    public string BatchModeTitle => IsProtectAction ? "Protect Mode" : "Unlock Mode";
 
     public string BatchSourceFolder
     {
@@ -508,6 +559,7 @@ public class ProtectViewModel : BaseViewModel
     public RelayCommand ClearAllPasswordsCommand { get; }
     public RelayCommand SelectBatchOutputFolderCommand { get; }
     public RelayCommand<ProtectBatchItem> ToggleBatchItemPasswordVisibilityCommand { get; }
+    public RelayCommand<ProtectBatchItem> ToggleBatchItemOwnerPasswordVisibilityCommand { get; }
     public RelayCommand AddBatchFilesCommand { get; }
     public RelayCommand RemoveSelectedBatchItemCommand { get; }
 
@@ -522,7 +574,7 @@ public class ProtectViewModel : BaseViewModel
         if (dialog.ShowDialog() == true)
         {
             InputPath = dialog.FileName;
-            OutputPath = FileNameHelper.CreateProtectedFilePath(InputPath);
+            OutputPath = CreateDefaultOutputPath(InputPath);
             StatusMessage = "Input file selected.";
             LastOperationSucceeded = false;
         }
@@ -533,10 +585,10 @@ public class ProtectViewModel : BaseViewModel
         var dialog = new SaveFileDialog
         {
             Filter = "PDF files (*.pdf)|*.pdf",
-            Title = "Save protected PDF",
+            Title = IsProtectAction ? "Save protected PDF" : "Save unlocked PDF",
             FileName = string.IsNullOrWhiteSpace(InputPath)
-                ? "protected.pdf"
-                : Path.GetFileNameWithoutExtension(InputPath) + ".protected.pdf"
+                ? (IsProtectAction ? "protected.pdf" : "unlocked.pdf")
+                : Path.GetFileName(CreateDefaultOutputPath(InputPath))
         };
 
         if (dialog.ShowDialog() == true)
@@ -557,7 +609,9 @@ public class ProtectViewModel : BaseViewModel
         if (dialog.ShowDialog() == true)
         {
             LoadBatchItems(dialog.FileNames, clearExisting: true);
-            StatusMessage = $"{BatchItems.Count} file(s) loaded for batch protection.";
+            StatusMessage = IsProtectAction
+                ? $"{BatchItems.Count} file(s) loaded for batch protection."
+                : $"{BatchItems.Count} file(s) loaded for batch unlock.";
         }
     }
 
@@ -592,7 +646,8 @@ public class ProtectViewModel : BaseViewModel
             var item = new ProtectBatchItem
             {
                 InputPath = file,
-                OutputPath = FileNameHelper.CreateProtectedFilePath(file),
+                OutputPath = CreateDefaultOutputPath(file),
+                OwnerPassword = IsProtectAction ? OwnerPassword : string.Empty,
                 Status = "Ready"
             };
 
@@ -645,6 +700,18 @@ public class ProtectViewModel : BaseViewModel
             return false;
         }
 
+        if (IsUnlockAction)
+        {
+            if (IsSingleMode)
+            {
+                return !string.IsNullOrWhiteSpace(InputPath)
+                       && !string.IsNullOrWhiteSpace(OutputPath)
+                       && !string.IsNullOrWhiteSpace(UserPassword);
+            }
+
+            return BatchItems.Count > 0 && BatchItems.All(item => !string.IsNullOrWhiteSpace(item.Password));
+        }
+
         if (!string.IsNullOrWhiteSpace(OwnerPassword) || HasRestrictedPermissions())
         {
             if (string.IsNullOrWhiteSpace(OwnerPassword))
@@ -661,40 +728,64 @@ public class ProtectViewModel : BaseViewModel
                    && (string.IsNullOrWhiteSpace(OwnerPassword) || PasswordHelper.MeetsStrongPolicy(OwnerPassword));
         }
 
-        return BatchItems.Count > 0 && BatchItems.All(item => PasswordHelper.MeetsStrongPolicy(item.Password));
+        return BatchItems.Count > 0
+               && BatchItems.All(item => PasswordHelper.MeetsStrongPolicy(item.Password))
+               && BatchItems.All(item =>
+               {
+                   var effectiveOwnerPassword = GetEffectiveBatchOwnerPassword(item);
+                   if (HasRestrictedPermissions() && string.IsNullOrWhiteSpace(effectiveOwnerPassword))
+                   {
+                       return false;
+                   }
+
+                   return string.IsNullOrWhiteSpace(effectiveOwnerPassword) || PasswordHelper.MeetsStrongPolicy(effectiveOwnerPassword);
+               });
     }
 
     private async void ProtectPdf()
     {
         if (IsSingleMode)
         {
-            await ProtectSingleAsync();
+            await ExecuteSingleAsync();
             return;
         }
 
-        await ProtectBatchAsync();
+        await ExecuteBatchAsync();
     }
 
-    private async Task ProtectSingleAsync()
+    private async Task ExecuteSingleAsync()
     {
         IsBusy = true;
-        _statusService.Start("Protecting PDF...");
-        _statusService.Report("Applying security settings...", 40);
+        _statusService.Start(IsProtectAction ? "Protecting PDF..." : "Unlocking PDF...");
+        _statusService.Report(IsProtectAction ? "Applying security settings..." : "Removing PDF protection...", 40);
 
-        var result = await Task.Run(() => _service.Protect(new PdfProtectionOptions
+        OperationResult result;
+        if (IsProtectAction)
         {
-            InputPath = InputPath,
-            OutputPath = OutputPath,
-            UserPassword = UserPassword,
-            OwnerPassword = OwnerPassword,
-            AllowPrint = AllowPrint,
-            AllowFullQualityPrint = AllowFullQualityPrint,
-            AllowModifyDocument = AllowModifyDocument,
-            AllowExtractContent = AllowExtractContent,
-            AllowAnnotations = AllowAnnotations,
-            AllowFormsFill = AllowFormsFill,
-            AllowAssembleDocument = AllowAssembleDocument
-        }));
+            result = await Task.Run(() => _service.Protect(new PdfProtectionOptions
+            {
+                InputPath = InputPath,
+                OutputPath = OutputPath,
+                UserPassword = UserPassword,
+                OwnerPassword = OwnerPassword,
+                AllowPrint = AllowPrint,
+                AllowFullQualityPrint = AllowFullQualityPrint,
+                AllowModifyDocument = AllowModifyDocument,
+                AllowExtractContent = AllowExtractContent,
+                AllowAnnotations = AllowAnnotations,
+                AllowFormsFill = AllowFormsFill,
+                AllowAssembleDocument = AllowAssembleDocument
+            }));
+        }
+        else
+        {
+            result = await Task.Run(() => _service.Unlock(new PdfUnlockOptions
+            {
+                InputPath = InputPath,
+                OutputPath = OutputPath,
+                Password = UserPassword
+            }));
+        }
 
         IsBusy = false;
         LastOperationSucceeded = result.Success;
@@ -703,19 +794,21 @@ public class ProtectViewModel : BaseViewModel
         if (result.Success)
         {
             _recentFilesService.AddFile(InputPath);
-            _statusService.Complete("Protect PDF completed.");
+            _statusService.Complete(IsProtectAction ? "Protect PDF completed." : "Unlock PDF completed.");
         }
         else
         {
-            _statusService.Fail("Protect PDF failed.");
+            _statusService.Fail(IsProtectAction ? "Protect PDF failed." : "Unlock PDF failed.");
         }
+
+        ClearSensitiveInputs("Passwords cleared after execution.");
     }
 
-    private async Task ProtectBatchAsync()
+    private async Task ExecuteBatchAsync()
     {
         IsBusy = true;
         LastOperationSucceeded = false;
-        _statusService.Start("Protecting batch files...", isIndeterminate: false, progressValue: 0);
+        _statusService.Start(IsProtectAction ? "Protecting batch files..." : "Unlocking batch files...", isIndeterminate: false, progressValue: 0);
 
         var validation = ValidateBatchGridCore();
         BatchValidationText = validation.Message;
@@ -736,24 +829,41 @@ public class ProtectViewModel : BaseViewModel
             var item = BatchItems[index];
             item.Status = "Processing...";
 
-            _statusService.Report($"Protecting {item.FileName} ({index + 1}/{BatchItems.Count})", (index * 100.0) / BatchItems.Count);
+            _statusService.Report(
+                $"{(IsProtectAction ? "Protecting" : "Unlocking")} {item.FileName} ({index + 1}/{BatchItems.Count})",
+                (index * 100.0) / BatchItems.Count);
 
-            var options = new PdfProtectionOptions
+            OperationResult result;
+            if (IsProtectAction)
             {
-                InputPath = item.InputPath,
-                OutputPath = item.OutputPath,
-                UserPassword = item.Password,
-                OwnerPassword = OwnerPassword,
-                AllowPrint = AllowPrint,
-                AllowFullQualityPrint = AllowFullQualityPrint,
-                AllowModifyDocument = AllowModifyDocument,
-                AllowExtractContent = AllowExtractContent,
-                AllowAnnotations = AllowAnnotations,
-                AllowFormsFill = AllowFormsFill,
-                AllowAssembleDocument = AllowAssembleDocument
-            };
+                var options = new PdfProtectionOptions
+                {
+                    InputPath = item.InputPath,
+                    OutputPath = item.OutputPath,
+                    UserPassword = item.Password,
+                    OwnerPassword = GetEffectiveBatchOwnerPassword(item),
+                    AllowPrint = AllowPrint,
+                    AllowFullQualityPrint = AllowFullQualityPrint,
+                    AllowModifyDocument = AllowModifyDocument,
+                    AllowExtractContent = AllowExtractContent,
+                    AllowAnnotations = AllowAnnotations,
+                    AllowFormsFill = AllowFormsFill,
+                    AllowAssembleDocument = AllowAssembleDocument
+                };
 
-            var result = await Task.Run(() => _service.Protect(options));
+                result = await Task.Run(() => _service.Protect(options));
+            }
+            else
+            {
+                var options = new PdfUnlockOptions
+                {
+                    InputPath = item.InputPath,
+                    OutputPath = item.OutputPath,
+                    Password = item.Password
+                };
+
+                result = await Task.Run(() => _service.Unlock(options));
+            }
 
             if (result.Success)
             {
@@ -763,7 +873,9 @@ public class ProtectViewModel : BaseViewModel
             }
             else
             {
-                item.Status = result.Message;
+                item.Status = result.Message.StartsWith("Error:", StringComparison.Ordinal)
+                    ? result.Message
+                    : $"Error: {result.Message}";
                 failCount++;
             }
         }
@@ -772,15 +884,18 @@ public class ProtectViewModel : BaseViewModel
         LastOperationSucceeded = failCount == 0;
         StatusMessage = $"Batch finished. Success: {successCount}. Failed: {failCount}.";
         UpdateBatchSummary();
+        BatchValidationText = ValidateBatchGridCore().Message;
 
         if (failCount == 0)
         {
-            _statusService.Complete("Batch protect completed.");
+            _statusService.Complete(IsProtectAction ? "Batch protect completed." : "Batch unlock completed.");
         }
         else
         {
-            _statusService.Fail("Batch protect finished with some failures.");
+            _statusService.Fail(IsProtectAction ? "Batch protect finished with some failures." : "Batch unlock finished with some failures.");
         }
+
+        ClearSensitiveInputs("Passwords cleared after execution. Re-enter passwords to run again.");
     }
 
     private void UseRecentFile()
@@ -792,21 +907,30 @@ public class ProtectViewModel : BaseViewModel
 
         InputMode = ProtectInputMode.SingleFile;
         InputPath = SelectedRecentFile.FilePath;
-        OutputPath = FileNameHelper.CreateProtectedFilePath(InputPath);
+        OutputPath = CreateDefaultOutputPath(InputPath);
         StatusMessage = "Recent file loaded.";
         LastOperationSucceeded = false;
     }
 
     private void ApplySamePasswordToAll()
     {
-        if (string.IsNullOrWhiteSpace(BatchCommonPassword))
+        if (string.IsNullOrWhiteSpace(BatchCommonPassword) && (IsUnlockAction || string.IsNullOrWhiteSpace(OwnerPassword)))
         {
             return;
         }
 
         foreach (var item in BatchItems)
         {
-            item.Password = BatchCommonPassword;
+            if (!string.IsNullOrWhiteSpace(BatchCommonPassword))
+            {
+                item.Password = BatchCommonPassword;
+            }
+
+            if (IsProtectAction && !string.IsNullOrWhiteSpace(OwnerPassword))
+            {
+                item.OwnerPassword = OwnerPassword;
+            }
+
             item.Status = "Ready";
         }
 
@@ -816,6 +940,11 @@ public class ProtectViewModel : BaseViewModel
 
     private void GeneratePasswords()
     {
+        if (IsUnlockAction)
+        {
+            return;
+        }
+
         foreach (var item in BatchItems)
         {
             item.Password = PasswordHelper.GeneratePassphrase();
@@ -864,6 +993,11 @@ public class ProtectViewModel : BaseViewModel
                 item.Password = match.Password;
             }
 
+            if (!string.IsNullOrWhiteSpace(match.OwnerPassword))
+            {
+                item.OwnerPassword = match.OwnerPassword;
+            }
+
             if (!string.IsNullOrWhiteSpace(match.OutputPath))
             {
                 item.OutputPath = match.OutputPath;
@@ -894,7 +1028,7 @@ public class ProtectViewModel : BaseViewModel
         }
 
         var builder = new StringBuilder();
-        builder.AppendLine("FileName,InputPath,OutputPath,Password");
+        builder.AppendLine("FileName,InputPath,OutputPath,Password,OwnerPassword");
 
         foreach (var item in BatchItems)
         {
@@ -902,7 +1036,8 @@ public class ProtectViewModel : BaseViewModel
                 Csv(item.FileName),
                 Csv(item.InputPath),
                 Csv(item.OutputPath),
-                Csv(item.Password)));
+                Csv(item.Password),
+                Csv(item.OwnerPassword)));
         }
 
         File.WriteAllText(dialog.FileName, builder.ToString(), Encoding.UTF8);
@@ -924,7 +1059,7 @@ public class ProtectViewModel : BaseViewModel
         }
 
         var builder = new StringBuilder();
-        builder.AppendLine("FileName,InputPath,OutputPath,Password");
+        builder.AppendLine("FileName,InputPath,OutputPath,Password,OwnerPassword");
 
         foreach (var item in BatchItems)
         {
@@ -932,7 +1067,8 @@ public class ProtectViewModel : BaseViewModel
                 Csv(item.FileName),
                 Csv(item.InputPath),
                 Csv(item.OutputPath),
-                Csv(item.Password)));
+                Csv(item.Password),
+                Csv(item.OwnerPassword)));
         }
 
         File.WriteAllText(dialog.FileName, builder.ToString(), Encoding.UTF8);
@@ -942,27 +1078,19 @@ public class ProtectViewModel : BaseViewModel
     private void UpdateBatchSummary()
     {
         var missingPasswords = BatchItems.Count(item => string.IsNullOrWhiteSpace(item.Password));
+        var missingOwnerPasswords = IsProtectAction && HasRestrictedPermissions()
+            ? BatchItems.Count(item => string.IsNullOrWhiteSpace(GetEffectiveBatchOwnerPassword(item)))
+            : 0;
         var warnings = BatchItems.Count(item => item.HasValidationWarning);
         var errors = BatchItems.Count(item => item.HasValidationError);
         BatchSummaryText = BatchItems.Count == 0
             ? "No batch files loaded."
-            : $"{BatchItems.Count} files loaded. Missing passwords: {missingPasswords}. Warnings: {warnings}. Errors: {errors}.";
+            : $"{BatchItems.Count} files loaded. Missing passwords: {missingPasswords}. Missing owner passwords: {missingOwnerPasswords}. Warnings: {warnings}. Errors: {errors}.";
     }
 
     public void ClearAllPasswords()
     {
-        UserPassword = string.Empty;
-        OwnerPassword = string.Empty;
-        BatchCommonPassword = string.Empty;
-
-        foreach (var item in BatchItems)
-        {
-            item.Password = string.Empty;
-            item.Status = "Error: Missing password";
-        }
-
-        UpdateBatchSummary();
-        ValidateBatchGrid();
+        ClearSensitiveInputs("Passwords cleared.", updateStatusMessage: true);
     }
 
     public void ToggleUserPasswordVisibility() => IsUserPasswordVisible = !IsUserPasswordVisible;
@@ -1023,16 +1151,47 @@ public class ProtectViewModel : BaseViewModel
 
     private void BatchItemOnPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(ProtectBatchItem.Password) or nameof(ProtectBatchItem.OutputPath) or nameof(ProtectBatchItem.Status))
+        if (e.PropertyName is nameof(ProtectBatchItem.Password) or nameof(ProtectBatchItem.OwnerPassword) or nameof(ProtectBatchItem.OutputPath) or nameof(ProtectBatchItem.Status))
         {
             UpdateBatchSummary();
             RefreshCommands();
         }
 
-        if (e.PropertyName is nameof(ProtectBatchItem.Password) or nameof(ProtectBatchItem.OutputPath) or nameof(ProtectBatchItem.InputPath))
+        if (!_suppressBatchValidationRefresh &&
+            e.PropertyName is nameof(ProtectBatchItem.Password) or nameof(ProtectBatchItem.OwnerPassword) or nameof(ProtectBatchItem.OutputPath) or nameof(ProtectBatchItem.InputPath))
         {
             BatchValidationText = ValidateBatchGridCore().Message;
         }
+    }
+
+    private void ClearSensitiveInputs(string validationMessage, bool updateStatusMessage = false)
+    {
+        _suppressBatchValidationRefresh = true;
+
+        try
+        {
+            UserPassword = string.Empty;
+            OwnerPassword = string.Empty;
+            BatchCommonPassword = string.Empty;
+
+            foreach (var item in BatchItems)
+            {
+                item.Password = string.Empty;
+                item.OwnerPassword = string.Empty;
+            }
+        }
+        finally
+        {
+            _suppressBatchValidationRefresh = false;
+        }
+
+        UpdateBatchSummary();
+        BatchValidationText = validationMessage;
+        if (updateStatusMessage)
+        {
+            StatusMessage = validationMessage;
+        }
+        RefreshCommands();
     }
 
     private void RefreshBatchGrid()
@@ -1040,6 +1199,7 @@ public class ProtectViewModel : BaseViewModel
         BatchItems.Clear();
         SelectedBatchItem = null;
         BatchSourceFolder = string.Empty;
+        BatchOutputFolder = string.Empty;
         UpdateBatchSummary();
         BatchValidationText = "Validation has not run yet.";
         StatusMessage = "Batch grid cleared.";
@@ -1058,7 +1218,7 @@ public class ProtectViewModel : BaseViewModel
         foreach (var item in BatchItems)
         {
             var fileName = Path.GetFileNameWithoutExtension(item.InputPath);
-            item.OutputPath = Path.Combine(BatchOutputFolder, $"{fileName}.protected.pdf");
+            item.OutputPath = Path.Combine(BatchOutputFolder, IsProtectAction ? $"{fileName}.protected.pdf" : $"{fileName}.unlocked.pdf");
         }
 
         ValidateBatchGrid();
@@ -1074,6 +1234,11 @@ public class ProtectViewModel : BaseViewModel
 
     private BatchValidationResult ValidateBatchGridCore()
     {
+        if (IsUnlockAction)
+        {
+            return ValidateUnlockBatchGridCore();
+        }
+
         var ready = 0;
         var errors = 0;
         var warnings = 0;
@@ -1085,7 +1250,11 @@ public class ProtectViewModel : BaseViewModel
         var outputLocked = 0;
         var shortPasswords = 0;
         var policyViolations = 0;
+        var missingOwnerPasswords = 0;
+        var ownerPolicyViolations = 0;
         var alreadyProtected = 0;
+        var invalidPdf = 0;
+        var protectedInputs = 0;
 
         foreach (var item in BatchItems)
         {
@@ -1117,15 +1286,15 @@ public class ProtectViewModel : BaseViewModel
                 outputMatchesInput++;
             }
 
-            if (!itemErrors.Any() && !FileAccessHelper.TryValidateReadableFile(item.InputPath, out _))
+            if (!itemErrors.Any() && !FileAccessHelper.TryValidateReadableFile(item.InputPath, out var readableError))
             {
-                itemErrors.Add("Input file locked");
+                itemErrors.Add(readableError);
                 locked++;
             }
 
-            if (!itemErrors.Any() && !FileAccessHelper.TryValidateOutputFile(item.OutputPath, out _))
+            if (!itemErrors.Any() && !FileAccessHelper.TryValidateOutputFile(item.OutputPath, out var outputError))
             {
-                itemErrors.Add("Output file locked");
+                itemErrors.Add(outputError);
                 outputLocked++;
             }
 
@@ -1141,10 +1310,33 @@ public class ProtectViewModel : BaseViewModel
                 policyViolations++;
             }
 
+            var effectiveOwnerPassword = GetEffectiveBatchOwnerPassword(item);
+            if (HasRestrictedPermissions() && string.IsNullOrWhiteSpace(effectiveOwnerPassword))
+            {
+                itemErrors.Add("Owner password is required when permissions are restricted");
+                missingOwnerPasswords++;
+            }
+
+            if (!string.IsNullOrWhiteSpace(effectiveOwnerPassword) && !PasswordHelper.MeetsStrongPolicy(effectiveOwnerPassword))
+            {
+                itemErrors.Add("Owner password must include uppercase, lowercase, number, and special character");
+                ownerPolicyViolations++;
+            }
+
             if (!itemErrors.Any())
             {
                 var info = _inspectorService.Inspect(item.InputPath);
-                if (info.IsEncrypted)
+                if (!info.IsPdf)
+                {
+                    itemErrors.Add(info.StatusMessage);
+                    invalidPdf++;
+                }
+                else if (info.RequiresPassword || info.IsPasswordIncorrect)
+                {
+                    itemErrors.Add("Input file is already protected and must be unlocked before batch protect.");
+                    protectedInputs++;
+                }
+                else if (info.IsEncrypted)
                 {
                     itemWarnings.Add("File already appears to be protected");
                     alreadyProtected++;
@@ -1172,7 +1364,128 @@ public class ProtectViewModel : BaseViewModel
         var isValid = errors == 0 && BatchItems.Count > 0;
         var message = BatchItems.Count == 0
             ? "No batch files loaded."
-            : $"{ready} ready, {warnings} warning, {errors} error. Missing input: {missingInput}. Missing output: {missingOutput}. Missing password: {missingPassword}. Short password: {shortPasswords}. Policy violations: {policyViolations}. Output matches input: {outputMatchesInput}. Input locked: {locked}. Output locked: {outputLocked}. Already protected: {alreadyProtected}.";
+            : $"{ready} ready, {warnings} warning, {errors} error. Missing input: {missingInput}. Missing output: {missingOutput}. Missing password: {missingPassword}. Missing owner password: {missingOwnerPasswords}. Short password: {shortPasswords}. Policy violations: {policyViolations}. Owner policy violations: {ownerPolicyViolations}. Output matches input: {outputMatchesInput}. Input locked: {locked}. Output locked: {outputLocked}. Invalid PDF: {invalidPdf}. Protected input: {protectedInputs}. Already protected: {alreadyProtected}.";
+
+        return new BatchValidationResult
+        {
+            IsValid = isValid,
+            Message = message
+        };
+    }
+
+    private BatchValidationResult ValidateUnlockBatchGridCore()
+    {
+        var ready = 0;
+        var errors = 0;
+        var warnings = 0;
+        var missingInput = 0;
+        var missingOutput = 0;
+        var missingPassword = 0;
+        var locked = 0;
+        var outputMatchesInput = 0;
+        var outputLocked = 0;
+        var invalidPdf = 0;
+        var incorrectPasswords = 0;
+        var ownerPasswordRequired = 0;
+        var unprotectedInputs = 0;
+
+        foreach (var item in BatchItems)
+        {
+            var itemErrors = new List<string>();
+            var itemWarnings = new List<string>();
+
+            if (!File.Exists(item.InputPath))
+            {
+                itemErrors.Add("Input file missing");
+                missingInput++;
+            }
+
+            if (string.IsNullOrWhiteSpace(item.OutputPath))
+            {
+                itemErrors.Add("Missing output path");
+                missingOutput++;
+            }
+
+            if (string.IsNullOrWhiteSpace(item.Password))
+            {
+                itemErrors.Add("Missing current password");
+                missingPassword++;
+            }
+
+            if (!itemErrors.Any() &&
+                string.Equals(item.InputPath, item.OutputPath, StringComparison.OrdinalIgnoreCase))
+            {
+                itemErrors.Add("Output matches input");
+                outputMatchesInput++;
+            }
+
+            if (!itemErrors.Any() && !FileAccessHelper.TryValidateReadableFile(item.InputPath, out var readableError))
+            {
+                itemErrors.Add(readableError);
+                locked++;
+            }
+
+            if (!itemErrors.Any() && !FileAccessHelper.TryValidateOutputFile(item.OutputPath, out var outputError))
+            {
+                itemErrors.Add(outputError);
+                outputLocked++;
+            }
+
+            if (!itemErrors.Any())
+            {
+                var plainInfo = _inspectorService.Inspect(item.InputPath);
+                if (!plainInfo.IsPdf)
+                {
+                    itemErrors.Add(plainInfo.StatusMessage);
+                    invalidPdf++;
+                }
+                else if (!plainInfo.IsEncrypted && !plainInfo.RequiresPassword)
+                {
+                    itemErrors.Add("Input file is not protected.");
+                    unprotectedInputs++;
+                }
+                else
+                {
+                    var unlockedInfo = _inspectorService.Inspect(item.InputPath, item.Password);
+                    if (!unlockedInfo.CanReadContents || unlockedInfo.IsPasswordIncorrect)
+                    {
+                        itemErrors.Add("Incorrect password for this PDF.");
+                        incorrectPasswords++;
+                    }
+                    else if (!PdfSecurityAccessHelper.TryHasOwnerLevelAccess(item.InputPath, item.Password, out _))
+                    {
+                        itemErrors.Add("Owner password is required to unlock this PDF.");
+                        ownerPasswordRequired++;
+                    }
+                    else if (unlockedInfo.IsEncrypted)
+                    {
+                        itemWarnings.Add("Output will remove protection and create an unlocked copy");
+                    }
+                }
+            }
+
+            if (itemErrors.Any())
+            {
+                item.Status = $"Error: {string.Join("; ", itemErrors)}";
+                errors++;
+                continue;
+            }
+
+            if (itemWarnings.Any())
+            {
+                item.Status = $"Warning: {string.Join("; ", itemWarnings)}";
+                warnings++;
+                continue;
+            }
+
+            item.Status = "Ready";
+            ready++;
+        }
+
+        var isValid = errors == 0 && BatchItems.Count > 0;
+        var message = BatchItems.Count == 0
+            ? "No batch files loaded."
+            : $"{ready} ready, {warnings} warning, {errors} error. Missing input: {missingInput}. Missing output: {missingOutput}. Missing password: {missingPassword}. Output matches input: {outputMatchesInput}. Input locked: {locked}. Output locked: {outputLocked}. Invalid PDF: {invalidPdf}. Incorrect password: {incorrectPasswords}. Owner password required: {ownerPasswordRequired}. Not protected: {unprotectedInputs}.";
 
         return new BatchValidationResult
         {
@@ -1189,6 +1502,16 @@ public class ProtectViewModel : BaseViewModel
         }
 
         item.IsPasswordVisible = !item.IsPasswordVisible;
+    }
+
+    private void ToggleBatchItemOwnerPasswordVisibility(ProtectBatchItem? item)
+    {
+        if (item == null)
+        {
+            return;
+        }
+
+        item.IsOwnerPasswordVisible = !item.IsOwnerPasswordVisible;
     }
 
     private static string Csv(string value)
@@ -1210,7 +1533,8 @@ public class ProtectViewModel : BaseViewModel
                 FileName = values.ElementAtOrDefault(0) ?? string.Empty,
                 InputPath = values.ElementAtOrDefault(1) ?? string.Empty,
                 OutputPath = values.ElementAtOrDefault(2) ?? string.Empty,
-                Password = values.ElementAtOrDefault(3) ?? string.Empty
+                Password = values.ElementAtOrDefault(3) ?? string.Empty,
+                OwnerPassword = values.ElementAtOrDefault(4) ?? string.Empty
             });
         }
 
@@ -1230,7 +1554,8 @@ public class ProtectViewModel : BaseViewModel
                 FileName = row.Cell(1).GetString(),
                 InputPath = row.Cell(2).GetString(),
                 OutputPath = row.Cell(3).GetString(),
-                Password = row.Cell(4).GetString()
+                Password = row.Cell(4).GetString(),
+                OwnerPassword = row.Cell(5).GetString()
             });
         }
 
@@ -1282,20 +1607,131 @@ public class ProtectViewModel : BaseViewModel
         public string InputPath { get; set; } = string.Empty;
         public string OutputPath { get; set; } = string.Empty;
         public string Password { get; set; } = string.Empty;
+        public string OwnerPassword { get; set; } = string.Empty;
     }
 
     private bool HasAnyPasswordValues()
         => !string.IsNullOrWhiteSpace(UserPassword)
            || !string.IsNullOrWhiteSpace(OwnerPassword)
            || !string.IsNullOrWhiteSpace(BatchCommonPassword)
-           || BatchItems.Any(item => !string.IsNullOrWhiteSpace(item.Password));
+           || BatchItems.Any(item => !string.IsNullOrWhiteSpace(item.Password) || !string.IsNullOrWhiteSpace(item.OwnerPassword));
+
+    private string GetEffectiveBatchOwnerPassword(ProtectBatchItem item)
+        => !IsProtectAction
+            ? string.Empty
+            : !string.IsNullOrWhiteSpace(item.OwnerPassword)
+                ? item.OwnerPassword
+                : OwnerPassword;
+
+    public ProtectSessionState CaptureSessionState()
+    {
+        return new ProtectSessionState
+        {
+            ActionMode = ActionMode,
+            InputMode = InputMode,
+            BatchPasswordStrategy = BatchPasswordStrategy,
+            InputPath = InputPath,
+            OutputPath = OutputPath,
+            BatchSourceFolder = BatchSourceFolder,
+            BatchOutputFolder = BatchOutputFolder,
+            AllowPrint = AllowPrint,
+            AllowFullQualityPrint = AllowFullQualityPrint,
+            AllowModifyDocument = AllowModifyDocument,
+            AllowExtractContent = AllowExtractContent,
+            AllowAnnotations = AllowAnnotations,
+            AllowFormsFill = AllowFormsFill,
+            AllowAssembleDocument = AllowAssembleDocument,
+            SelectedBatchItemIndex = SelectedBatchItem != null ? BatchItems.IndexOf(SelectedBatchItem) : -1,
+            BatchItems = BatchItems.Select(item => new ProtectBatchItemSessionState
+            {
+                InputPath = item.InputPath,
+                OutputPath = item.OutputPath,
+                Status = item.Status
+            }).ToList()
+        };
+    }
+
+    public void RestoreSessionState(ProtectSessionState? state)
+    {
+        if (state == null)
+        {
+            return;
+        }
+
+        ActionMode = state.ActionMode;
+        InputMode = state.InputMode;
+        BatchPasswordStrategy = state.BatchPasswordStrategy;
+        AllowPrint = state.AllowPrint;
+        AllowFullQualityPrint = state.AllowFullQualityPrint;
+        AllowModifyDocument = state.AllowModifyDocument;
+        AllowExtractContent = state.AllowExtractContent;
+        AllowAnnotations = state.AllowAnnotations;
+        AllowFormsFill = state.AllowFormsFill;
+        AllowAssembleDocument = state.AllowAssembleDocument;
+
+        InputPath = state.InputPath ?? string.Empty;
+        OutputPath = state.OutputPath ?? string.Empty;
+        UserPassword = string.Empty;
+        OwnerPassword = string.Empty;
+        BatchCommonPassword = string.Empty;
+        BatchSourceFolder = state.BatchSourceFolder ?? string.Empty;
+        BatchOutputFolder = state.BatchOutputFolder ?? string.Empty;
+
+        BatchItems.Clear();
+        foreach (var itemState in state.BatchItems)
+        {
+            BatchItems.Add(new ProtectBatchItem
+            {
+                InputPath = itemState.InputPath,
+                OutputPath = itemState.OutputPath,
+                Status = string.IsNullOrWhiteSpace(itemState.Status) ? "Ready" : itemState.Status
+            });
+        }
+
+        SelectedBatchItem = state.SelectedBatchItemIndex >= 0 && state.SelectedBatchItemIndex < BatchItems.Count
+            ? BatchItems[state.SelectedBatchItemIndex]
+            : null;
+
+        UpdateBatchSummary();
+        BatchValidationText = ValidateBatchGridCore().Message;
+        LastOperationSucceeded = false;
+        StatusMessage = "Protect session restored. Passwords must be re-entered.";
+        RefreshCommands();
+    }
+
+    private string CreateDefaultOutputPath(string inputPath)
+        => IsProtectAction
+            ? FileNameHelper.CreateProtectedFilePath(inputPath)
+            : FileNameHelper.CreateUnlockedFilePath(inputPath);
+
+    private void UpdateOutputPathsForActionMode()
+    {
+        if (!string.IsNullOrWhiteSpace(InputPath))
+        {
+            OutputPath = CreateDefaultOutputPath(InputPath);
+        }
+
+        foreach (var item in BatchItems)
+        {
+            item.OutputPath = CreateDefaultOutputPath(item.InputPath);
+        }
+
+        BatchValidationText = ValidateBatchGridCore().Message;
+        UpdateBatchSummary();
+    }
 
     private void UpdateUserPasswordStrength()
     {
         var strength = PasswordHelper.EvaluateStrength(UserPassword);
         UserPasswordStrengthScore = strength.Score;
         UserPasswordStrengthLabel = strength.Label;
-        UserPasswordStrengthGuidance = strength.Guidance;
+        UserPasswordStrengthGuidance = string.IsNullOrWhiteSpace(UserPassword)
+            ? IsProtectAction
+                ? "Enter a password to protect the PDF."
+                : "Enter the owner password to create an unlocked copy."
+            : IsProtectAction
+                ? strength.Guidance
+                : "This must be the owner or full-access password for the PDF.";
     }
 
     private void UpdateOwnerPasswordStrength()
@@ -1314,8 +1750,12 @@ public class ProtectViewModel : BaseViewModel
         CommonPasswordStrengthScore = strength.Score;
         CommonPasswordStrengthLabel = strength.Label;
         CommonPasswordStrengthGuidance = string.IsNullOrWhiteSpace(BatchCommonPassword)
-            ? "Use one shared password for all loaded files."
-            : strength.Guidance;
+            ? IsProtectAction
+                ? "Use one shared password for all loaded files."
+                : "Use one shared owner password for all loaded files."
+            : IsProtectAction
+                ? strength.Guidance
+                : "This owner password will be used to unlock every loaded PDF.";
     }
 
     private sealed class BatchValidationResult
